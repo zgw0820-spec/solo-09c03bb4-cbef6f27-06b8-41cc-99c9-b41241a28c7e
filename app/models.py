@@ -105,6 +105,34 @@ class PrecheckRequest(BaseModel):
                         "run_replay": True,
                     },
                 },
+                {
+                    "summary": "误报回归：夹独有单但共享单相对顺序一致（无死锁）",
+                    "value": {
+                        "batches": [
+                            {"batch_id": "B1",
+                             "order_ids": ["W1", "W9", "W9b", "W2"],
+                             "assignee": "alice"},
+                            {"batch_id": "B2",
+                             "order_ids": ["W8", "W1", "W2"],
+                             "assignee": "bob"},
+                        ],
+                        "run_replay": True,
+                    },
+                },
+                {
+                    "summary": "漏报回归：独有单推偏位置、共享单相对顺序反转（真死锁）",
+                    "value": {
+                        "batches": [
+                            {"batch_id": "B1",
+                             "order_ids": ["W1", "W2"],
+                             "assignee": "alice"},
+                            {"batch_id": "B2",
+                             "order_ids": ["W9", "W2", "W1"],
+                             "assignee": "bob"},
+                        ],
+                        "run_replay": True,
+                    },
+                },
             ]
         }
     }
@@ -123,13 +151,31 @@ class PrecheckRequest(BaseModel):
 
 
 class WaitEdge(BaseModel):
-    """等待边：waiter 批次在执行 order_id 时等待 holder 批次释放行锁。"""
+    """候选等待边：waiter 批次在执行 order_id 时可能等待 holder 批次释放行锁。
+
+    边按"共享工单上两个等待方向都可能被调度命中"枚举；单边方向不做
+    提前裁剪，是否真的构成死锁以环的全局交错可达性为准
+    （``on_feasible_cycle`` 标记参与了可实现环的边）。
+    """
 
     waiter_batch: str
     holder_batch: str
     order_id: str
     waiter_step: int = Field(..., description="等待方在本批中的第几步（从 1 开始）")
     holder_step: int = Field(..., description="持有方在本批中的第几步（从 1 开始）")
+    on_feasible_cycle: bool = Field(
+        default=False,
+        description="该边是否参与了至少一个存在见证交错、可实跑复现的死锁环",
+    )
+
+
+class WitnessStep(BaseModel):
+    """见证交错中的一个拿锁动作（环上批次同时等锁前的全局操作序列）。"""
+
+    seq: int = Field(..., description="全局执行序号，从 1 开始")
+    batch_id: str
+    step: int = Field(..., description="批次内第几步，从 1 开始")
+    order_id: str
 
 
 class CycleReport(BaseModel):
@@ -140,6 +186,11 @@ class CycleReport(BaseModel):
         "cycle_batches[i] 在 cycle_orders[i] 上等待下一个批次",
     )
     edges: List[WaitEdge] = Field(..., description="参与循环的等待边")
+    witness: List[WitnessStep] = Field(
+        ...,
+        description="见证交错：按此序列逐单拿锁后，环上各批将同时阻塞在各自等待的"
+        "工单上；实跑执行器按该序列调度复现",
+    )
 
 
 class ReplayStep(BaseModel):

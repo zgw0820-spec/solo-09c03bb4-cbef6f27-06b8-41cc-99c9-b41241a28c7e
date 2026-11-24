@@ -7,13 +7,35 @@
 - 每轮试跑 DROP SCHEMA ... CASCADE 后重建，上一轮的行、锁、改派结果
   全部物理清除；
 - 每批一个独立连接/线程，事务只可能 COMMIT 或 ROLLBACK，结束后连接
-  归还并关闭；试跑收尾再用 ``pg_stat_activity`` 核查无未结束事务、
-  用全表扫描核查无改派残留。
+  关闭；试跑收尾再用 ``pg_stat_activity`` 核查无未结束事务、用全表
+  扫描核查无改派残留。
+
+实跑调度（按静态分析给出的见证交错）
+====================================
+旧实现用全局 Barrier 让所有批次同节拍起步，这隐含"各批在同一步号等锁"
+的假设；独有单会让环上批次在**不同步数**才进入等待，Barrier 节拍会把
+真实交错打乱（抢跑拿齐锁、或永远到不了环上等待点）。
+
+新执行器完全按分析器为所选环产出的 ``witness`` 调度：
+1. 不在环上的旁观批次，先各自开事务按提交顺序跑完并 COMMIT，它们不
+   持有任何环上争用单（否则该批也在环里），不会干扰环；
+2. 环上批次各自开连接/事务，协调器按 witness 的全局序号逐单下发
+   UPDATE（acquire 前缀）；
+3. 前缀完成后，协调器同时放行各批的"等待工单" UPDATE——各批即使在
+   不同步号进入等待也没关系，协调器轮询 ``pg_stat_activity`` 直到环上
+   各批都出现 ``wait_event_type='Lock'``，真实记录 block 现场；
+4. 等待 PostgreSQL 死锁检测器（``deadlock_timeout=200ms``）中止牺牲者，
+   捕获 ``psycopg.errors.DeadlockDetected`` 且校验 SQLSTATE=40P01；
+   幸存者解除阻塞后按各自提交顺序跑完剩余单并 COMMIT；
+5. 未收到 40P01 时如实区分：先触发 lock_timeout（55P03）、全部提交
+   未形成环、或执行异常。
 """
 
 from __future__ import annotations
 
+import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -31,11 +53,11 @@ from .models import (
 )
 
 DEADLOCK_SQLSTATE = "40P01"
+LOCK_TIMEOUT_SQLSTATE = "55P03"
 
 
 def connect(autocommit: bool = False) -> psycopg.Connection:
-    conn = psycopg.connect(settings.database_url, autocommit=autocommit)
-    return conn
+    return psycopg.connect(settings.database_url, autocommit=autocommit)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,13 +135,26 @@ def _trial_table() -> sql.Composed:
 @dataclass
 class _BatchRun:
     batch: BatchInput
+    pid: Optional[int] = None
     error_sqlstate: Optional[str] = None
     error_message: Optional[str] = None
     committed: bool = False
     blocked_order: Optional[str] = None
     blocked_holder: Optional[str] = None
+    # 进入环上等待瞬间已完成的步数（阻塞前进度，不受后续幸存推进影响）
+    blocked_last_step: Optional[int] = None
     last_step: int = 0
+    in_cycle: bool = False
     steps: List[ReplayStep] = field(default_factory=list)
+
+
+@dataclass
+class _Task:
+    """协调器下发给工作线程的一单个 UPDATE 任务。"""
+
+    step: int
+    order_id: str
+    expect_block: bool  # True：环上等待工单，预期进入锁等待
 
 
 def _holder_of(admin_conn: psycopg.Connection, order_id: str) -> Optional[str]:
@@ -172,7 +207,7 @@ def _is_waiting(admin_conn: psycopg.Connection, pid: int) -> Optional[str]:
 def replay_deadlock(
     batches: List[BatchInput], cycle: CycleReport
 ) -> ReplayReport:
-    """按检测到的环构造交错调度并实跑，验证是否收到 SQLSTATE 40P01。"""
+    """按所选环的见证交错构造调度并实跑，验证是否收到 SQLSTATE 40P01。"""
     admin = connect(autocommit=True)
     admin.execute(f"SET lock_timeout = {int(settings.lock_timeout_ms)}")
     reset_trial_schema(admin)
@@ -190,6 +225,54 @@ def replay_deadlock(
             admin.close()
 
 
+class _SeqCounter:
+    """全局操作序号计数器，旁观批与环上批共用，保证序号全局唯一。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._v = 0
+
+    def next(self) -> int:
+        with self._lock:
+            self._v += 1
+            return self._v
+
+
+def _run_standalone_batch(batch: BatchInput, seq: _SeqCounter) -> _BatchRun:
+    """旁观批次（不在环上）：独立事务按提交顺序跑完即提交。"""
+    run = _BatchRun(batch=batch)
+    # autocommit=True 后显式 BEGIN，事务边界完全可控（见 worker 同名说明）
+    conn = connect(autocommit=True)
+    try:
+        conn.execute("BEGIN")
+        # SET LOCAL 仅在当前事务内生效，且必须在 BEGIN 之后执行。
+        conn.execute(f"SET LOCAL lock_timeout = {int(settings.lock_timeout_ms)}")
+        for step, oid in enumerate(batch.order_ids, start=1):
+            _update_order(conn, oid, batch.assignee)
+            run.last_step = step
+            run.steps.append(
+                ReplayStep(
+                    seq=seq.next(),
+                    batch_id=batch.batch_id,
+                    step=step,
+                    order_id=oid,
+                    action="acquire",
+                    note="旁观批次，环外先行执行",
+                )
+            )
+        conn.execute("COMMIT")
+        run.committed = True
+    except Exception:  # noqa: BLE001 - 试跑线程内兜底，保证连接关闭
+        try:
+            conn.rollback()
+        except Exception:  # pragma: no cover
+            pass
+        raise
+    finally:
+        conn.close()
+    return run
+
+
 def _replay_inner(
     batches: List[BatchInput],
     cycle: CycleReport,
@@ -204,69 +287,118 @@ def _replay_inner(
             [(oid,) for oid in all_orders],
         )
 
-    # 环上的批次（cycle_batches 不重复），cycle_orders[k] 是
-    # cycle_batches[k] 等待下一个批次时所争用的工单。
-    cyc_batches = cycle.cycle_batches
-    cyc_orders = cycle.cycle_orders
+    cyc_batches = list(cycle.cycle_batches)
+    cyc_orders = list(cycle.cycle_orders)
     n = len(cyc_batches)
+    cycle_set = set(cyc_batches)
 
-    # 每个环上批次的"阻塞工单"= 它等待的下一个批次先拿到的那张单
-    block_order: Dict[str, str] = {}
-    for k, bid in enumerate(cyc_batches):
-        block_order[bid] = cyc_orders[k]
-
-    # 非环上批次（三批输入、二环时存在）按各自完整顺序参与调度，
-    # 它们不持有环上的争用单（否则也会在环里），正常跑完即可。
-
-    barrier = threading.Barrier(len(batches))
-    runs: Dict[str, _BatchRun] = {
-        b.batch_id: _BatchRun(batch=b) for b in batches
+    # 每个环上批次的阻塞工单 = 它等待的下一个批次先拿到的那张单
+    block_order: Dict[str, str] = dict(zip(cyc_batches, cyc_orders))
+    holder_by_order: Dict[str, str] = {
+        cyc_orders[k]: cyc_batches[(k + 1) % n] for k in range(n)
     }
-    seq_lock = threading.Lock()
-    seq_counter = {"v": 0}
 
-    def next_seq() -> int:
-        with seq_lock:
-            seq_counter["v"] += 1
-            return seq_counter["v"]
+    runs: Dict[str, _BatchRun] = {
+        b.batch_id: _BatchRun(batch=b, in_cycle=b.batch_id in cycle_set)
+        for b in batches
+    }
+    seq = _SeqCounter()
+
+    worker_errors: List[str] = []
+
+    # ---- 阶段 0：旁观批次先独立跑完（不持环上争用单，不影响环）-------- #
+    standalone = [b for b in batches if b.batch_id not in cycle_set]
+    for batch in standalone:
+        try:
+            runs[batch.batch_id] = _run_standalone_batch(batch, seq)
+        except Exception as exc:  # noqa: BLE001
+            worker_errors.append(
+                f"旁观批 {batch.batch_id} 执行失败：{type(exc).__name__}: {exc}"
+            )
+
+    # ---- 阶段 1：环上批次工作线程：队列驱动，一次只执行一个 UPDATE ---- #
+    task_queues: Dict[str, "queue.Queue[Optional[_Task]]"] = {}
+    done_events: Dict[str, threading.Event] = {}
+    results: Dict[str, Optional[Exception]] = {}
 
     def worker(batch: BatchInput) -> None:
         run = runs[batch.batch_id]
-        conn = connect()
-        conn.execute(f"SET lock_timeout = {int(settings.lock_timeout_ms)}")
-        own_pid = conn.execute("SELECT pg_backend_pid()").fetchone()[0]
-        block_recorded = threading.Event()
+        # autocommit=True 保证 pg_backend_pid 查询不会隐式开事务，
+        # 事务边界完全由下面的显式 BEGIN/COMMIT/ROLLBACK 控制。
+        conn = connect(autocommit=True)
+        run.pid = conn.execute("SELECT pg_backend_pid()").fetchone()[0]
+        q = task_queues[batch.batch_id]
         try:
             conn.execute("BEGIN")
-            for step, oid in enumerate(batch.order_ids, start=1):
-                # 锁步：保证环上各批按同一全局节拍交错，避免某个批次抢跑
-                # 直接拿齐两把锁把死锁退化成普通等待。
-                barrier.wait(settings.trial_timeout_s)
-
-                # UPDATE 放在内部线程执行，本线程轮询 pg_stat_activity：
-                # 一旦观察到本后端进入 Lock 等待，先落一条 block 记录。
-                update_err: dict[str, Exception] = {}
-
-                def do_update() -> None:
+            # SET LOCAL 仅在当前事务内生效，必须在 BEGIN 之后执行。
+            conn.execute(f"SET LOCAL lock_timeout = {int(settings.lock_timeout_ms)}")
+            while True:
+                task = q.get()
+                if task is None:
+                    # 协调器通知收尾：提交事务
+                    conn.execute("COMMIT")
+                    run.committed = True
+                    done_events[batch.batch_id].set()
+                    return
+                try:
+                    _update_order(conn, task.order_id, batch.assignee)
+                    results[batch.batch_id] = None
+                except Exception as exc:  # noqa: BLE001
+                    results[batch.batch_id] = exc
+                    # 出错（40P01/55P03/其他）后事务必须回滚，线程退出
                     try:
-                        _update_order(conn, oid, batch.assignee)
-                    except Exception as exc:  # noqa: BLE001
-                        update_err["exc"] = exc
+                        conn.rollback()
+                    except Exception:  # pragma: no cover
+                        pass
+                    done_events[batch.batch_id].set()
+                    return
+                finally:
+                    q.task_done()
+                done_events[batch.batch_id].set()
+        except Exception as exc:  # noqa: BLE001 - 兜底，保证连接关闭
+            results[batch.batch_id] = exc
+            done_events[batch.batch_id].set()
+        finally:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover
+                pass
 
-                ut = threading.Thread(target=do_update, daemon=True)
-                ut.start()
-                while ut.is_alive():
-                    ut.join(timeout=0.02)
-                    wait = _is_waiting(admin, own_pid)
-                    if wait and not block_recorded.is_set():
-                        run.blocked_order = oid
-                        run.blocked_holder = _holder_of(admin, oid)
+    for bid in cyc_batches:
+        task_queues[bid] = queue.Queue()
+        done_events[bid] = threading.Event()
+
+    deadline = time.monotonic() + settings.trial_timeout_s + 5
+
+    with ThreadPoolExecutor(max_workers=len(cyc_batches)) as pool:
+        futures = {
+            bid: pool.submit(worker, next(b for b in batches if b.batch_id == bid))
+            for bid in cyc_batches
+        }
+
+        def dispatch(bid: str, task: _Task) -> Optional[Exception]:
+            """下发单个 UPDATE 并轮询记录 block 现场，返回执行异常（若有）。"""
+            run = runs[bid]
+            done_events[bid].clear()
+            results[bid] = None
+            task_queues[bid].put(task)
+            block_seen = False
+            while not done_events[bid].wait(timeout=0.02):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"批次 {bid} 第 {task.step} 步执行超时")
+                if not block_seen:
+                    wait = _is_waiting(admin, run.pid)
+                    if wait:
+                        block_seen = True
+                        run.blocked_order = task.order_id
+                        run.blocked_holder = _holder_of(admin, task.order_id)
+                        run.blocked_last_step = run.last_step
                         run.steps.append(
                             ReplayStep(
-                                seq=next_seq(),
-                                batch_id=batch.batch_id,
-                                step=step,
-                                order_id=oid,
+                                seq=seq.next(),
+                                batch_id=bid,
+                                step=task.step,
+                                order_id=task.order_id,
                                 action="block",
                                 note=(
                                     f"进入锁等待（{wait}），持有方连接 "
@@ -274,105 +406,209 @@ def _replay_inner(
                                 ),
                             )
                         )
-                        block_recorded.set()
-                if "exc" in update_err:
-                    exc = update_err["exc"]
-                    if isinstance(exc, psycopg.errors.DeadlockDetected):
-                        run.error_sqlstate = exc.sqlstate
-                        run.error_message = str(exc).strip()
-                        run.blocked_order = oid
-                        run.last_step = step - 1
-                        run.steps.append(
-                            ReplayStep(
-                                seq=next_seq(),
-                                batch_id=batch.batch_id,
-                                step=step,
-                                order_id=oid,
-                                action="abort",
-                                note=(
-                                    "PostgreSQL 死锁检测中止本事务，"
-                                    f"SQLSTATE={exc.sqlstate}"
-                                ),
-                            )
-                        )
-                        conn.rollback()
-                        return
-                    if isinstance(exc, psycopg.errors.LockNotAvailable):
-                        run.error_sqlstate = exc.sqlstate
-                        run.error_message = str(exc).strip()
-                        run.blocked_order = oid
-                        run.last_step = step - 1
-                        if not block_recorded.is_set():
-                            run.steps.append(
-                                ReplayStep(
-                                    seq=next_seq(),
-                                    batch_id=batch.batch_id,
-                                    step=step,
-                                    order_id=oid,
-                                    action="block",
-                                    note=(
-                                        f"lock_timeout {settings.lock_timeout_ms}ms"
-                                        " 触发，未及采样到等待事件"
-                                    ),
-                                )
-                            )
-                        conn.rollback()
-                        return
-                    raise exc
-                # UPDATE 正常返回：行锁已到手（若此前在等待，等待已结束）
-                run.last_step = step
+            exc = results[bid]
+            if exc is not None:
+                return exc
+            # 正常返回：行锁到手
+            run.last_step = task.step
+            run.steps.append(
+                ReplayStep(
+                    seq=seq.next(),
+                    batch_id=bid,
+                    step=task.step,
+                    order_id=task.order_id,
+                    action="acquire",
+                    note="曾阻塞等待后获得锁" if block_seen else None,
+                )
+            )
+            return None
+
+        # 每批当前在飞任务（已下发、未收口），None 表示空闲
+        in_flight: Dict[str, Optional[_Task]] = {bid: None for bid in cyc_batches}
+        block_recorded: Dict[str, bool] = {bid: False for bid in cyc_batches}
+
+        def record_block_if_waiting(bid: str, task: _Task) -> None:
+            """轮询一次：若该批在飞任务已进入锁等待，补一条 block 记录。"""
+            if block_recorded[bid]:
+                return
+            run = runs[bid]
+            wait = _is_waiting(admin, run.pid)
+            if wait:
+                block_recorded[bid] = True
+                run.blocked_order = task.order_id
+                run.blocked_holder = _holder_of(admin, task.order_id)
+                run.blocked_last_step = run.last_step
                 run.steps.append(
                     ReplayStep(
-                        seq=next_seq(),
-                        batch_id=batch.batch_id,
-                        step=step,
-                        order_id=oid,
-                        action="acquire",
-                        note="曾阻塞等待后获得锁"
-                        if block_recorded.is_set()
-                        else None,
+                        seq=seq.next(),
+                        batch_id=bid,
+                        step=task.step,
+                        order_id=task.order_id,
+                        action="block",
+                        note=(
+                            f"进入锁等待（{wait}），持有方连接 "
+                            f"pid={run.blocked_holder}"
+                        ),
                     )
                 )
-                block_recorded.clear()
-            conn.execute("COMMIT")
-            run.committed = True
-        except Exception:  # noqa: BLE001 - 试跑线程内兜底，保证连接关闭
-            try:
-                conn.rollback()
-            except Exception:  # pragma: no cover
-                pass
-            raise
+
+        def try_collect(bid: str) -> str:
+            """非阻塞收口在飞任务：busy / acquired / failed。"""
+            task = in_flight[bid]
+            if task is None:
+                return "busy"
+            record_block_if_waiting(bid, task)
+            if not done_events[bid].is_set():
+                return "busy"
+            exc = results[bid]
+            in_flight[bid] = None
+            block_recorded[bid] = False
+            if exc is not None:
+                _record_failure(runs[bid], task, exc, seq)
+                if not isinstance(
+                    exc,
+                    (psycopg.errors.DeadlockDetected,
+                     psycopg.errors.LockNotAvailable),
+                ):
+                    worker_errors.append(
+                        f"批次 {bid} 执行异常：{type(exc).__name__}: {exc}"
+                    )
+                return "failed"
+            run = runs[bid]
+            run.last_step = task.step
+            run.steps.append(
+                ReplayStep(
+                    seq=seq.next(),
+                    batch_id=bid,
+                    step=task.step,
+                    order_id=task.order_id,
+                    action="acquire",
+                    note="曾阻塞等待后获得锁"
+                    if any(s.action == "block" and s.step == task.step
+                           for s in run.steps)
+                    else None,
+                )
+            )
+            return "acquired"
+
+        try:
+            # 阶段 2：按见证交错的全局序号逐单下发前缀（预期全部拿锁成功，
+            # 见证前缀的每张单在该调度点都无人持锁，不会阻塞）
+            for wstep in cycle.witness:
+                exc = dispatch(
+                    wstep.batch_id,
+                    _Task(step=wstep.step, order_id=wstep.order_id,
+                          expect_block=False),
+                )
+                if exc is not None:
+                    worker_errors.append(
+                        f"见证前缀执行异常 {wstep.batch_id}/{wstep.order_id}："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    break
+
+            # 阶段 3：同时放行环上各批的等待工单 UPDATE。各批即使在不同
+            # 步号进入等待也允许——只轮询等待状态，不做同节拍假设。
+            if not worker_errors:
+                for bid in cyc_batches:
+                    run = runs[bid]
+                    wait_oid = block_order[bid]
+                    wait_step = run.batch.order_ids.index(wait_oid) + 1
+                    task = _Task(step=wait_step, order_id=wait_oid,
+                                 expect_block=True)
+                    done_events[bid].clear()
+                    results[bid] = None
+                    in_flight[bid] = task
+                    block_recorded[bid] = False
+                    task_queues[bid].put(task)
+
+                # 等到环上各批都进入锁等待（同时等锁的死锁现场），
+                # 或已有批次被死锁检测/lock_timeout 中止。
+                while True:
+                    if time.monotonic() > deadline:
+                        worker_errors.append("等待环上各批进入锁等待超时")
+                        break
+                    for bid in cyc_batches:
+                        if in_flight[bid] is not None:
+                            record_block_if_waiting(bid, in_flight[bid])
+                    if all(block_recorded.values()) or any(
+                        done_events[b].is_set() and results[b] is not None
+                        for b in cyc_batches
+                    ):
+                        break
+                    time.sleep(0.02)
+
+            # 阶段 4~5：环形排空。绝不同时阻塞等待所有批次——死锁环被
+            # 打破前所有在飞任务都会挂住，必须让已就绪的批次继续推进
+            # （拿后续锁、COMMIT），幸存者提交后环自然解开。
+            while not worker_errors and any(
+                in_flight[b] is not None
+                or (runs[b].error_sqlstate is None
+                    and runs[b].last_step < len(runs[b].batch.order_ids))
+                for b in cyc_batches
+            ):
+                if time.monotonic() > deadline:
+                    worker_errors.append("试跑环形排空整体超时")
+                    break
+                progress = False
+                for bid in cyc_batches:
+                    run = runs[bid]
+                    if run.error_sqlstate is not None:
+                        continue  # 已回滚退出，不再下发
+                    status = try_collect(bid)
+                    if status == "busy":
+                        continue  # 还在等锁，先放行其他批次，杜绝协调器自锁
+                    progress = True
+                    if status == "failed":
+                        continue
+                    # acquired：按提交顺序继续下发下一单；跑完则通知提交
+                    batch = run.batch
+                    next_step = run.last_step + 1
+                    if next_step <= len(batch.order_ids):
+                        oid = batch.order_ids[next_step - 1]
+                        done_events[bid].clear()
+                        results[bid] = None
+                        in_flight[bid] = _Task(
+                            step=next_step, order_id=oid, expect_block=False
+                        )
+                        block_recorded[bid] = False
+                        task_queues[bid].put(in_flight[bid])
+                    else:
+                        done_events[bid].clear()
+                        task_queues[bid].put(None)
+                        if not done_events[bid].wait(
+                            timeout=max(0.1, deadline - time.monotonic())
+                        ):
+                            worker_errors.append(f"批次 {bid} COMMIT 超时")
+                        else:
+                            run.committed = True
+                if not progress:
+                    # 本圈全部在等锁：死锁检测器（200ms）会很快中止牺牲者，
+                    # 最坏由 lock_timeout（10s）兜底，短暂让出即可。
+                    time.sleep(0.02)
         finally:
-            try:
-                conn.close()
-            except Exception:  # pragma: no cover
-                pass
+            # 确保所有工作线程退出（异常路径下投放哨兵；已退出的队列无害）
+            for bid in cyc_batches:
+                try:
+                    task_queues[bid].put(None)
+                except Exception:  # pragma: no cover
+                    pass
+            for bid, fut in futures.items():
+                try:
+                    fut.result(timeout=max(0.1, deadline - time.monotonic()))
+                except FutTimeout:
+                    worker_errors.append(f"工作线程 {bid} 整体超时")
+                except Exception as exc:  # noqa: BLE001
+                    worker_errors.append(f"{bid}: {type(exc).__name__}: {exc}")
 
-    timeout = settings.trial_timeout_s + 5
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        futures = [pool.submit(worker, b) for b in batches]
-        worker_errors: List[str] = []
-        for f in futures:
-            try:
-                f.result(timeout=timeout)
-            except FutTimeout:
-                worker_errors.append("试跑线程整体超时")
-            except Exception as exc:  # noqa: BLE001
-                worker_errors.append(f"{type(exc).__name__}: {exc}")
-
-    # 阻塞信息补全：被死锁检测中止时当前事务已回滚，持锁方可能已查不到，
-    # 用等待图静态信息补齐 holder 批次。
-    holder_by_order: Dict[str, str] = {}
-    for k, bid in enumerate(cyc_batches):
-        holder_by_order[cyc_orders[k]] = cyc_batches[(k + 1) % n]
-
-    victims = [bid for bid, r in runs.items() if r.error_sqlstate == DEADLOCK_SQLSTATE]
+    victims = [
+        bid for bid, r in runs.items() if r.error_sqlstate == DEADLOCK_SQLSTATE
+    ]
     lock_timeouts = [
         bid for bid, r in runs.items()
-        if r.error_sqlstate == "55P03"
+        if r.error_sqlstate == LOCK_TIMEOUT_SQLSTATE
     ]
 
-    # 汇总操作顺序
     all_steps: List[ReplayStep] = sorted(
         [s for r in runs.values() for s in r.steps],
         key=lambda s: s.seq,
@@ -387,7 +623,11 @@ def _replay_inner(
                 batch_id=bid,
                 waits_for_order=waits_order,
                 waits_for_holder=holder_by_order[waits_order],
-                last_acquired_step=r.last_step,
+                last_acquired_step=(
+                    r.blocked_last_step
+                    if r.blocked_last_step is not None
+                    else r.last_step
+                ),
             )
         )
 
@@ -405,7 +645,7 @@ def _replay_inner(
             "说明调度形成了真实锁等待但死锁检测未在超时前打破环；"
             "可调大 LOCK_TIMEOUT_MS 或调小服务端 deadlock_timeout 后重试。"
         )
-        sqlstate = "55P03"
+        sqlstate = LOCK_TIMEOUT_SQLSTATE
     elif worker_errors:
         detail = "试跑执行异常，未能确认死锁：" + "；".join(worker_errors)
         sqlstate = None
@@ -429,6 +669,33 @@ def _replay_inner(
         batch_waits=batch_waits,
         cleanup_ok=cleanup_ok,
     )
+
+
+def _record_failure(
+    run: _BatchRun,
+    task: Optional[_Task],
+    exc: Exception,
+    seq: "_SeqCounter",
+) -> None:
+    """登记工作线程返回的死锁/锁超时/其他异常，并落 abort 步骤。"""
+    run.error_sqlstate = getattr(exc, "sqlstate", None)
+    run.error_message = str(exc).strip()
+    if task is not None:
+        run.blocked_order = task.order_id
+        run.last_step = task.step - 1
+        run.steps.append(
+            ReplayStep(
+                seq=seq.next(),
+                batch_id=run.batch.batch_id,
+                step=task.step,
+                order_id=task.order_id,
+                action="abort",
+                note=(
+                    f"事务被中止，SQLSTATE={run.error_sqlstate}，"
+                    f"信息：{run.error_message}"
+                ),
+            )
+        )
 
 
 def _verify_and_cleanup(

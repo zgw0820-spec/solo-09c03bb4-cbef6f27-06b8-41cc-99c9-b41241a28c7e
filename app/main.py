@@ -72,8 +72,9 @@ def precheck(req: PrecheckRequest) -> PrecheckResponse:
             wait_edges=edges,
             replay=None,
             message=(
-                "未发现循环等锁：各批对共享工单的加锁顺序一致，"
-                "任意交错都只会产生单向等待，不会死锁。"
+                "未发现可实现的循环等锁：不存在任何全局交错能让两批以上事务"
+                "同时进入互相等待（共享工单的相对加锁顺序未反转，"
+                "或候选环在联合状态空间中不可达），任意调度都不会死锁。"
             ),
         )
 

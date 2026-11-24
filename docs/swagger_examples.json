@@ -20,5 +20,21 @@
       {"batch_id": "B2", "order_ids": ["W9", "W1", "W2"], "assignee": "bob"}
     ],
     "run_replay": true
+  },
+  "false_positive_regression_expect_no_deadlock": {
+    "_comment": "共享单 W1/W2 在两批相对顺序一致（都 W1 先 W2 后），独有单只改变绝对位置；旧实现误报 1 环，正确结论 has_deadlock=false",
+    "batches": [
+      {"batch_id": "B1", "order_ids": ["W1", "W9", "W9b", "W2"], "assignee": "alice"},
+      {"batch_id": "B2", "order_ids": ["W8", "W1", "W2"], "assignee": "bob"}
+    ],
+    "run_replay": true
+  },
+  "false_negative_regression_expect_40P01": {
+    "_comment": "共享单相对顺序真实反转（B1: W1<W2，B2: W2<W1），独有单 W9 把 W2 推到同号位置；旧实现漏报 0 环，正确结论有环且实跑 40P01",
+    "batches": [
+      {"batch_id": "B1", "order_ids": ["W1", "W2"], "assignee": "alice"},
+      {"batch_id": "B2", "order_ids": ["W9", "W2", "W1"], "assignee": "bob"}
+    ],
+    "run_replay": true
   }
 }
